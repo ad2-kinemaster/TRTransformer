@@ -26,7 +26,8 @@ struct Fields {
 
     /// (number of keys compared, human-readable mismatches)
     static func compare(_ a: Fields, _ b: Fields, names: (String, String) = ("current", "oracle")) -> (Int, [String]) {
-        var mismatches: [String] = []
+        let (a, divergenceMismatches) = reconcileReverseLastFrame(a, b)
+        var mismatches: [String] = divergenceMismatches
         let bByKey = Dictionary(b.items.map { ($0.key, $0.value) }, uniquingKeysWith: { x, _ in x })
         let aKeys = Set(a.items.map(\.key))
         for (k, va) in a.items {
@@ -38,7 +39,109 @@ struct Fields {
             }
         }
         for (k, vb) in b.items where !aKeys.contains(k) { mismatches.append("\(k): only in \(names.1) (\(vb))") }
+        // the ±1 per-frame index tolerance is decode noise; a whole sequence off by one frame moves the mean to about ±1
+        var shift: [Double] = []
+        for (k, va) in a.items where index(k, prefix: "out.frames[", suffix: "].index") != nil {
+            if case let .num(x, _) = va, case let .num(y, _)? = bByKey[k] { shift.append(x - y) }
+        }
+        if !shift.isEmpty {
+            let mean = shift.reduce(0, +) / Double(shift.count)
+            if abs(mean) > 0.5 { mismatches.append("out.frames[*].index: mean \(names.0) - \(names.1) = \(mean) (sequence shifted by a frame)") }
+        }
         return (a.items.count, mismatches)
+    }
+
+    // MARK: intended divergence from the oracle
+
+    static let reverseKind = "reverse"
+
+    /// KIOS-10596: the frozen ObjC oracle never writes the source's last frame when reversing (its last pass reads the
+    /// half-open range [lastPassStart, lastSamplePTS)); the current implementation does. For a reverse record (`kind`)
+    /// whose output has exactly one frame more than the oracle's, this checks the expected deltas and rewrites `a`
+    /// into the oracle's shape so every other key is still compared unchanged:
+    /// - output frame 0 is one source frame later than the oracle's first (the source's last frame); the rest line up after dropping it,
+    /// - one more "Reversing Video" progress step, the last one at 1.0 (oracle: N-1 of N),
+    /// - video track and last frame PTS one frame (1 / fps) longer; file duration either equal (longer audio) or one frame longer.
+    /// Returns the rewritten record and any violated expectation (as mismatches). Records that don't fit are returned as is.
+    static func reconcileReverseLastFrame(_ a: Fields, _ b: Fields) -> (Fields, [String]) {
+        guard a.exactValue("kind") == reverseKind, b.exactValue("kind") == reverseKind,
+              let an = a.exactValue("out.frames.count").flatMap(Int.init),
+              let bn = b.exactValue("out.frames.count").flatMap(Int.init) else { return (a, []) }
+        guard an == bn + 1 else {
+            // both succeeded with output: the extra frame must be there (catches the old drop coming back)
+            let bothOk = a.exactValue("ok") == "true" && b.exactValue("ok") == "true" && an > 0
+            return (a, bothOk ? ["KIOS-10596 expected divergence: frames.count current=\(an) oracle=\(bn) (want oracle + 1)"] : [])
+        }
+        var problems: [String] = []
+        func expect(_ ok: Bool, _ what: String) { if !ok { problems.append("KIOS-10596 expected divergence: \(what)") } }
+
+        if bn > 0, let a0 = a.numValue("out.frames[0].index"), let b0 = b.numValue("out.frames[0].index") {
+            expect(abs(a0 - (b0 + 1)) <= Tol.frameIndex, "frames[0].index current=\(a0) oracle=\(b0) (want oracle + 1)")
+        }
+
+        // progress: the extra "Reversing Video" step
+        var dropProgress: Int? = nil
+        let aRev = a.progressIndexes(op: "Reversing Video"), bRev = b.progressIndexes(op: "Reversing Video")
+        if !aRev.isEmpty || !bRev.isEmpty {
+            expect(aRev.count == bRev.count + 1, "Reversing Video steps current=\(aRev.count) oracle=\(bRev.count) (want oracle + 1)")
+            if aRev.count == bRev.count + 1, let j = aRev.last {
+                expect(abs((a.numValue("progress[\(j)].value") ?? -1) - 1.0) <= Tol.progress, "last Reversing Video value is not 1.0")
+                dropProgress = j
+            }
+        }
+
+        let fps = a.numValue("out.video[0].fps") ?? 0
+        let frame = fps > 0 ? 1 / fps : 0
+        var replace: [String: Double] = [:]
+        for (k, strict) in [("out.frames.last.pts", true), ("out.video[0].trackDuration", true), ("out.duration", false)] {
+            guard let x = a.numValue(k), let y = b.numValue(k) else { continue }
+            if abs(x - y - frame) <= Tol.seconds {
+                replace[k] = y
+            } else {
+                expect(!strict && abs(x - y) <= Tol.seconds, "\(k) current=\(x) oracle=\(y) (want oracle + \(frame))")
+            }
+        }
+
+        var out = Fields()
+        for (k, v) in a.items {
+            if k == "out.frames.count" { out.items.append((k, .exact("\(bn)"))); continue }
+            if let i = Self.index(k, prefix: "out.frames[", suffix: "].index") {
+                if i > 0 { out.items.append(("out.frames[\(i - 1)].index", v)) }
+                continue
+            }
+            if let j = dropProgress {
+                if k == "progress.count", let n = a.exactValue(k).flatMap(Int.init) { out.items.append((k, .exact("\(n - 1)"))); continue }
+                if let i = Self.index(k, prefix: "progress[", suffix: "].op") ?? Self.index(k, prefix: "progress[", suffix: "].value") {
+                    if i == j { continue }
+                    if i > j { out.items.append((k.replacingOccurrences(of: "progress[\(i)]", with: "progress[\(i - 1)]"), v)); continue }
+                }
+            }
+            if let y = replace[k], case let .num(_, tol) = v { out.items.append((k, .num(y, tol: tol))); continue }
+            out.items.append((k, v))
+        }
+        return (out, problems)
+    }
+
+    private static func index(_ key: String, prefix: String, suffix: String) -> Int? {
+        guard key.hasPrefix(prefix), key.hasSuffix(suffix) else { return nil }
+        return Int(key.dropFirst(prefix.count).dropLast(suffix.count))
+    }
+
+    private func exactValue(_ key: String) -> String? {
+        guard let v = items.first(where: { $0.key == key })?.value, case let .exact(s) = v else { return nil }
+        return s
+    }
+
+    private func numValue(_ key: String) -> Double? {
+        guard let v = items.first(where: { $0.key == key })?.value, case let .num(x, _) = v else { return nil }
+        return x
+    }
+
+    private func progressIndexes(op: String) -> [Int] {
+        items.compactMap { k, v in
+            guard let i = Self.index(k, prefix: "progress[", suffix: "].op"), case let .exact(s) = v, s == op else { return nil }
+            return i
+        }
     }
 }
 

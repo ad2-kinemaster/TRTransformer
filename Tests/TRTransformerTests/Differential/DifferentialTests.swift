@@ -50,6 +50,7 @@ class DifferentialTestCase: TRTestCase {
         let s = impl.reverse(AVURLAsset(url: src), range: range ?? fullRange(src), video: video, audio: audio, out: out)
         let o = run(s, cancelAfterFirstProgress: cancelAfterFirstProgress)
         var f = Record.outcome(o, impl: impl, progress: !cancelAfterFirstProgress)
+        f.exact("kind", Fields.reverseKind)
         f.merge("out.", Record.file(out))
         return f
     }

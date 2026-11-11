@@ -244,6 +244,7 @@ final class CorpusDifferentialTests: TRTestCase {
         let s = impl.reverse(AVURLAsset(url: src), range: range, video: video, audio: audio, out: out)
         let (o, to) = runSession(s)
         var f = Record.outcome(o, impl: impl)
+        f.exact("kind", Fields.reverseKind)
         if !to { f.merge("out.", Record.file(out)) }
         cleanup(out)
         return (f, to, o.elapsed)

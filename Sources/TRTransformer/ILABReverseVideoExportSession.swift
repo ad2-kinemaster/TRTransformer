@@ -50,6 +50,7 @@ open class ILABReverseVideoExportSession: NSObject {
 
     private var sourceAsset: AVAsset?
     private var reversingVideoAsset: AVAsset?
+    private var reversingVideoEnd: CMTime = .zero
     private var reversedAudioAsset: AVAsset?
     private var exportSession: AVAssetExportSession?
     private var audioExporter: ILABAudioTrackExporter?
@@ -128,6 +129,9 @@ open class ILABReverseVideoExportSession: NSObject {
             try? vTrack?.insertTimeRange(timeRange, of: track, at: CMTime.zero)
         }
         self.reversingVideoAsset = videoComposition
+        // Past the source track's end the composition still runs to timeRange's end, yielding empty (black) samples.
+        self.reversingVideoEnd = track.map { CMTimeMinimum(videoComposition.duration, CMTimeSubtract($0.timeRange.end, timeRange.start)) }
+            ?? videoComposition.duration
 
         self.configureSourceMeta()
 
@@ -547,7 +551,7 @@ open class ILABReverseVideoExportSession: NSObject {
                     NSLog("configure presentation time: %f", CMTimeGetSeconds(presentationTime))
                 }
 
-                if CMTimeCompare(CMTimeAdd(CMTime.zero, weakSelf!.reversingVideoAsset!.duration), presentationTime) == 0 {
+                if CMTimeCompare(presentationTime, weakSelf!.reversingVideoEnd) >= 0 {
                     if weakSelf?.showDebug ?? false {
                         NSLog("reverse last frame skip: %.3f", CMTimeGetSeconds(presentationTime))
                     }
@@ -639,9 +643,11 @@ open class ILABReverseVideoExportSession: NSObject {
             // ObjC compared NSUInteger with NSInteger here, i.e. both sides unsigned.
             if (UInt(passDicts.count) < UInt(bitPattern: totalPasses)) ||
                 (cURem(UInt(revSampleTimes.count), UInt(bitPattern: weakSelf!.samplesPerPass)) != 0) {
+                // Ranges are half-open: ending at the last PTS would drop that frame; ending later would read empty samples.
+                let lastPassEndTime = weakSelf!.reversingVideoEnd
                 passDicts.append(ReversePass(
                     passStartTime: passStartTime,
-                    passEndTime: passEndTime,
+                    passEndTime: lastPassEndTime,
                     timeStartIndex: timeStartIndex,
                     timeEndIndex: timeEndIndex,
                     frameStartIndex: frameStartIndex,

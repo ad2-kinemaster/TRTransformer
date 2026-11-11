@@ -180,9 +180,9 @@ final class APIContractTests: TRTestCase {
         XCTAssertFalse(analyzing.isEmpty); XCTAssertFalse(reversing.isEmpty)
         XCTAssertTrue(analyzing.allSatisfy { $0 >= 0 && $0 <= 0.5 }, "analysis phase maps to 0...0.5")
         XCTAssertTrue(reversing.allSatisfy { $0 > 0.5 && $0 <= 1.0 }, "reversal phase maps to 0.5...1")
-        // PINNED: the reversal phase tops out at 0.5 + 0.5 * 59/60 because the last source frame is never written
-        // (see ReverseTests pinned frame-drop); only the "Saving Reversed Video" step reports 1.0.
-        XCTAssertEqual(reversing.last ?? 0, 0.5 + 0.5 * 59.0 / 60.0, accuracy: 0.0001)
+        // one "Reversing Video" step per written frame: all 60 source frames, so it ends at 0.5 + 0.5 * 60/60
+        XCTAssertEqual(reversing.count, 60)
+        XCTAssertEqual(reversing.last ?? 0, 1.0, accuracy: 0.0001)
     }
 
     func testMissingOutputURL_failsSynchronously_once() throws {
