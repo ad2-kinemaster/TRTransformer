@@ -1,5 +1,5 @@
 import AVFoundation
-import TRTransformer
+@testable import TRTransformer
 import XCTest
 
 /// ILABReverseVideoExportSession output, measured from the produced file. Source: `Fixture.multiStream` unless noted.
@@ -204,6 +204,168 @@ final class ReverseTests: TRTestCase {
         let t = try XCTUnwrap(AVURLAsset(url: out).tracks(withMediaType: .video).first)
         XCTAssertEqual(t.segments.first?.isEmpty, true, "fixture: leading empty edit")
         return out
+    }
+
+    // MARK: non-IDR sync sample
+
+    /// stss also lists a non-IDR frame (decode sample 11, ~0.5 s; the only IDR is sample 1): a pass read that starts after
+    /// it fails to decode (-11821 / -12137). The pass is re-read from an earlier start on a new reader and every frame is
+    /// still written once, in order. 40/pass: [2.0, 3.0) retried from 0. 15/pass: the last pass steps back (doubling)
+    /// until 0 works; every later failing pass then reuses that start on its first retry read.
+    func testNonIDRSyncSample_passReadFails_isRetriedFromEarlierStart() throws {
+        let src = try makeNonIDRSyncSource()
+        for perPass in [40, 15] {
+            var session: ILABReverseVideoExportSession?
+            let (o, out) = reverse(src, out: "nonidr\(perPass).mov") { $0.samplesPerPass = perPass; session = $0 }
+            log("R non-IDR sync \(perPass)/pass", out)
+            XCTAssertTrue(o.succeeded, "\(perPass)/pass: \(describe(o))")
+            XCTAssertEqual(o.completionCount, 1)
+            assertReversedFrames(out, count: 60, label: "\(perPass)/pass")
+
+            let reads = try XCTUnwrap(session).retryReads
+            print("[TRT] retry reads \(perPass)/pass: \(reads.map { String(format: "%.2f:%@", $0.start.seconds, $0.ok ? "ok" : "fail") })")
+            guard let firstOK = reads.firstIndex(where: { $0.ok }) else { XCTFail("\(perPass)/pass: no retry succeeded"); continue }
+            XCTAssertEqual(reads[firstOK].start.seconds, 0, accuracy: 0.001, "\(perPass)/pass: only 0 is before the fake sync")
+            XCTAssertTrue(reads[..<firstOK].allSatisfy { !$0.ok && $0.start.seconds > 0 }, "\(perPass)/pass: earlier starts tried first")
+            let later = reads[(firstOK + 1)...]
+            XCTAssertTrue(later.allSatisfy { $0.ok && $0.start.seconds == 0 },
+                          "\(perPass)/pass: later failing passes recover on the remembered start, one read each")
+            if perPass == 15 {
+                // passes start at 0, 0.75, 1.5, 2.25: 2.25 tries 1.5, 0.75, 0; then 1.5 and 0.75 retry from 0 once each
+                XCTAssertEqual(reads.count, 5, "\(perPass)/pass")
+            }
+        }
+    }
+
+    /// 5/pass = 12 passes starting every 0.25 s; only 0 and 0.25 lie before the fake sync (0.5 s). The last pass (2.75)
+    /// must step back by 1, 2, 4, 8 passes (2.5, 2.25, 1.75, 0.75) and then 0 — one pass at a time would read 2.0 third.
+    func testNonIDRSyncSample_retryStepsBackByDoublingPassCount() throws {
+        let src = try makeNonIDRSyncSource()
+        var session: ILABReverseVideoExportSession?
+        let (o, out) = reverse(src, out: "nonidr5.mov") { $0.samplesPerPass = 5; session = $0 }
+        XCTAssertTrue(o.succeeded, describe(o))
+        XCTAssertEqual(o.completionCount, 1)
+        assertReversedFrames(out, count: 60, label: "5/pass")
+
+        let reads = try XCTUnwrap(session).retryReads
+        print("[TRT] retry reads 5/pass: \(reads.map { String(format: "%.2f:%@", $0.start.seconds, $0.ok ? "ok" : "fail") })")
+        let first = Array(reads.prefix(5))
+        XCTAssertEqual(first.count, 5)
+        for (read, (start, ok)) in zip(first, [(2.5, false), (2.25, false), (1.75, false), (0.75, false), (0.0, true)]) {
+            XCTAssertEqual(read.start.seconds, start, accuracy: 0.001, "doubling back from 2.75: \(reads)")
+            XCTAssertEqual(read.ok, ok, "read from \(start)")
+        }
+        let later = reads.dropFirst(5)
+        XCTAssertTrue(later.allSatisfy { $0.ok && $0.start.seconds == 0 }, "later passes reuse the remembered start: \(reads)")
+        // passes 2.5 ... 0.75 fail (8); the one starting on the fake sync itself (0.5) may or may not
+        XCTAssertTrue((8...9).contains(later.count), "one retry read per later failing pass: \(later.count)")
+    }
+
+    /// Real IDRs at 0 / 0.95 / 1.9 / 2.85 s and a fake sync at 1.5 s (decode sample 31). 5/pass: the 1.75 pass fails and recovers
+    /// from a NON-zero start (1.25, on the 0.95 IDR), so the new reader's timeRange begins at 1.25 and every earlier pass
+    /// (1.0 ... 0) is read by reset(forReadingTimeRanges:) outside that range. None may come back empty.
+    func testNonIDRSyncSample_midFile_recoversFromNonZeroStart_earlierPassesStillRead() throws {
+        #if targetEnvironment(simulator)
+        throw XCTSkip("needs the hardware decoder (device or Mac Catalyst)")
+        #endif
+        var spec = Fixture.videoOnly
+        spec.videos[0].keyFrameInterval = 20
+        let src = try makeSource(spec, name: "nonidr-mid.mov")
+        XCTAssertEqual(try syncFrames(src), [0, 19, 38, 57], "fixture: the encoder puts IDRs 19 frames apart")
+        try Fixture.addSyncSample(31, to: src)
+
+        var session: ILABReverseVideoExportSession?
+        let (o, out) = reverse(src, out: "nonidr-mid5.mov") { $0.samplesPerPass = 5; session = $0 }
+        XCTAssertTrue(o.succeeded, describe(o))
+        XCTAssertEqual(o.completionCount, 1)
+        assertReversedFrames(out, count: 60, label: "mid fake sync 5/pass")
+
+        let reads = try XCTUnwrap(session).retryReads
+        print("[TRT] retry reads mid 5/pass: \(reads.map { String(format: "%.2f:%@", $0.start.seconds, $0.ok ? "ok" : "fail") })")
+        let firstOK = try XCTUnwrap(reads.first(where: { $0.ok }), "no retry succeeded: \(reads)")
+        XCTAssertEqual(firstOK.start.seconds, 1.25, accuracy: 0.001, "recovered on a non-zero start: \(reads)")
+        XCTAssertFalse(reads.contains { $0.start.seconds < 1.25 }, "never had to go back to 0: \(reads)")
+    }
+
+    /// Display-order frame indices of the first video track's sync samples (20 fps).
+    private func syncFrames(_ url: URL) throws -> [Int] {
+        let asset = AVURLAsset(url: url)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(asset.tracks(withMediaType: .video).first), outputSettings: nil)
+        reader.add(output)
+        XCTAssertTrue(reader.startReading())
+        var frames: [Int] = []
+        while let s = output.copyNextSampleBuffer() {
+            guard CMSampleBufferGetNumSamples(s) > 0 else { continue }
+            let att = CMSampleBufferGetSampleAttachmentsArray(s, createIfNecessary: false) as? [[CFString: Any]]
+            if !((att?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false) {
+                frames.append(Int((CMSampleBufferGetPresentationTimeStamp(s).seconds * 20).rounded()))
+            }
+        }
+        return frames.sorted()
+    }
+
+    /// Trimmed range [1.025, 2.5) (starts inside frame 20) after the non-IDR sync (~0.5 s): even composition time 0
+    /// decodes from that sync and the analysis read fails. A lead-in composition from earlier in the source is read
+    /// instead; the output must equal reversing the same range of the unpatched file, which itself takes no lead-in.
+    func testNonIDRSyncSample_beforeTrimStart_leadIn_matchesCleanSource() throws {
+        let clean = url("clean.mov")
+        let src = try makeNonIDRSyncSource(cleanCopy: clean)
+        let range = CMTimeRange(start: CMTime(value: 41, timescale: 40), end: CMTime(value: 5, timescale: 2))
+        for perPass in [40, 15] {
+            var cleanSession: ILABReverseVideoExportSession?
+            let (co, cleanOut) = reverse(clean, range: range, out: "clean\(perPass).mov") { $0.samplesPerPass = perPass; cleanSession = $0 }
+            log("R clean trim \(perPass)/pass", cleanOut)
+            XCTAssertTrue(co.succeeded, "clean \(perPass)/pass: \(describe(co))")
+            XCTAssertNil(try XCTUnwrap(cleanSession).leadIn, "clean source: no lead-in")
+            XCTAssertTrue(try XCTUnwrap(cleanSession).retryReads.isEmpty, "clean source: no pass retry")
+
+            var session: ILABReverseVideoExportSession?
+            let (o, out) = reverse(src, range: range, out: "leadin\(perPass).mov") { $0.samplesPerPass = perPass; session = $0 }
+            log("R non-IDR trim \(perPass)/pass", out)
+            XCTAssertTrue(o.succeeded, "\(perPass)/pass: \(describe(o))")
+            XCTAssertEqual(o.completionCount, 1)
+            XCTAssertNotNil(try XCTUnwrap(session).leadIn, "\(perPass)/pass: lead-in used")
+            XCTAssertTrue(o.progressValues.allSatisfy { $0 >= 0 && $0 <= 1 }, "\(perPass)/pass: progress in 0...1")
+
+            let want = Measure.frames(cleanOut), got = Measure.frames(out)
+            XCTAssertEqual(want.count, 30, "clean: straddling frame 20 + frames 21...49")
+            XCTAssertEqual(got.count, want.count, "\(perPass)/pass: frame count")
+            guard got.count == want.count, let first = got.first else { continue }
+            XCTAssertEqual(first.pts, 0, accuracy: 0.0001, "\(perPass)/pass: starts at 0")
+            XCTAssertEqual(first.index, 49, accuracy: 1, "\(perPass)/pass: last frame of the range first")
+            for (i, (g, w)) in zip(got, want).enumerated() {
+                XCTAssertEqual(g.pts, w.pts, accuracy: 0.0001, "\(perPass)/pass: pts of output frame \(i)")
+                XCTAssertEqual(g.index, w.index, accuracy: 1, "\(perPass)/pass: source frame of output frame \(i)")
+            }
+            XCTAssertEqual(Measure.duration(out), Measure.duration(cleanOut), accuracy: 0.0001, "\(perPass)/pass: duration")
+            assertNonIncreasing(got.map(\.index))
+        }
+    }
+
+    /// `Fixture.videoOnly` with one IDR (key frame interval > clip) and decode sample 11 added to stss.
+    /// Checks that a plain read from 1.0 s really fails to decode, so the tests above exercise the retry.
+    private func makeNonIDRSyncSource(cleanCopy: URL? = nil) throws -> URL {
+        #if targetEnvironment(simulator)
+        // the simulator's software decoder conceals the missing references (garbage frames) instead of failing the read
+        throw XCTSkip("needs the hardware decoder (device or Mac Catalyst)")
+        #endif
+        var spec = Fixture.videoOnly
+        spec.videos[0].keyFrameInterval = 120
+        let src = try makeSource(spec, name: "nonidr.mov")
+        if let clean = cleanCopy { try FileManager.default.copyItem(at: src, to: clean) }
+        try Fixture.addSyncSample(11, to: src)
+        let asset = AVURLAsset(url: src)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(asset.tracks(withMediaType: .video).first),
+                                              outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        reader.add(output)
+        reader.timeRange = CMTimeRange(start: CMTime(value: 1, timescale: 1), duration: CMTime(value: 1, timescale: 1))
+        XCTAssertTrue(reader.startReading())
+        while output.copyNextSampleBuffer() != nil {}
+        XCTAssertEqual(reader.status, .failed, "fixture: a read starting after the non-IDR sync sample fails")
+        XCTAssertEqual((reader.error as NSError?)?.code, AVError.Code.decodeFailed.rawValue, String(describing: reader.error))
+        return src
     }
 
     // MARK: pinned bugs

@@ -85,7 +85,8 @@ extension TRTestCase {
         return (run(session), out)
     }
 
-    func reverse(_ src: URL, video: Int? = nil, audio: Int? = nil, range: CMTimeRange? = nil, out name: String = "out.mov") -> (Outcome, URL) {
+    func reverse(_ src: URL, video: Int? = nil, audio: Int? = nil, range: CMTimeRange? = nil, out name: String = "out.mov",
+                 configure: (ILABReverseVideoExportSession) -> Void = { _ in }) -> (Outcome, URL) {
         let asset = AVURLAsset(url: src)
         let tr = range ?? CMTimeRange(start: .zero, duration: asset.duration)
         let out = url(name)
@@ -95,6 +96,7 @@ extension TRTestCase {
         } else {
             session = ILABReverseVideoExportSession(asset: asset, timeRange: tr, outputURL: out)
         }
+        configure(session)
         return (run(session), out)
     }
 

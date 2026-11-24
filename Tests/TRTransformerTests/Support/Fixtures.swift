@@ -30,6 +30,7 @@ enum Fixture {
         var codec: AVVideoCodecType = .h264
         var alpha: Bool = false
         var hdrHLG: Bool = false
+        var keyFrameInterval: Int = 10
     }
 
     struct Audio {
@@ -92,7 +93,7 @@ enum Fixture {
             var compression: [String: Any] = [:]
             if v.codec == .h264 {
                 compression[AVVideoAverageBitRateKey] = 4_000_000
-                compression[AVVideoMaxKeyFrameIntervalKey] = 10
+                compression[AVVideoMaxKeyFrameIntervalKey] = v.keyFrameInterval
             } else if v.codec == .hevc || v.codec == .hevcWithAlpha {
                 compression[AVVideoAverageBitRateKey] = 4_000_000
                 compression[AVVideoMaxKeyFrameIntervalKey] = 10
@@ -294,5 +295,53 @@ class TRTestCase: XCTestCase {
             throw error
         }
         return u
+    }
+}
+
+// MARK: - Sync sample table patch
+
+extension Fixture {
+    /// Adds `sample` (1-based, decode order) to the first video track's sync sample table (stss), in place.
+    /// Mimics muxers that list non-IDR frames as sync: AVFoundation then starts decoding a seek there and fails.
+    /// Needs moov after mdat (AVAssetWriter's .mov layout) so growing moov moves no chunk offsets.
+    static func addSyncSample(_ sample: UInt32, to url: URL) throws {
+        var d = [UInt8](try Data(contentsOf: url))
+        func u32(_ o: Int) -> Int { Int(d[o]) << 24 | Int(d[o + 1]) << 16 | Int(d[o + 2]) << 8 | Int(d[o + 3]) }
+        func be(_ v: Int) -> [UInt8] { [UInt8(v >> 24 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)] }
+        func type(_ o: Int) -> String { String(bytes: d[(o + 4)..<(o + 8)], encoding: .ascii) ?? "" }
+        func child(_ name: String, in range: Range<Int>, where ok: (Int) -> Bool = { _ in true }) -> Int? {
+            var o = range.lowerBound
+            while o + 8 <= range.upperBound {
+                let size = u32(o)
+                guard size >= 8 else { return nil }
+                if type(o) == name && ok(o) { return o }
+                o += size
+            }
+            return nil
+        }
+        func body(_ o: Int) -> Range<Int> { (o + 8)..<(o + u32(o)) }
+        guard let moov = child("moov", in: 0..<d.count), let mdat = child("mdat", in: 0..<d.count), mdat < moov else {
+            throw Failure.writer("stss patch: needs moov after mdat")
+        }
+        func isVideo(_ trak: Int) -> Bool {
+            guard let mdia = child("mdia", in: body(trak)), let hdlr = child("hdlr", in: body(mdia)) else { return false }
+            return String(bytes: d[(hdlr + 16)..<(hdlr + 20)], encoding: .ascii) == "vide"
+        }
+        guard let trak = child("trak", in: body(moov), where: isVideo),
+              let mdia = child("mdia", in: body(trak)), let minf = child("minf", in: body(mdia)),
+              let stbl = child("stbl", in: body(minf)), let stss = child("stss", in: body(stbl)) else {
+            throw Failure.writer("stss patch: no video stss")
+        }
+        let count = u32(stss + 12)
+        var entries = (0..<count).map { UInt32(u32(stss + 16 + 4 * $0)) }
+        guard !entries.contains(sample) else { throw Failure.writer("stss patch: \(sample) already sync") }
+        entries = (entries + [sample]).sorted()
+        var box = be(16 + 4 * entries.count) + Array(d[(stss + 4)..<(stss + 12)]) + be(entries.count)
+        for e in entries { box += be(Int(e)) }
+        d.replaceSubrange(stss..<(stss + u32(stss)), with: box)
+        for parent in [moov, trak, mdia, minf, stbl] {
+            d.replaceSubrange(parent..<(parent + 4), with: be(u32(parent) + 4))
+        }
+        try Data(d).write(to: url)
     }
 }

@@ -51,6 +51,11 @@ open class ILABReverseVideoExportSession: NSObject {
     private var sourceAsset: AVAsset?
     private var reversingVideoAsset: AVAsset?
     private var reversingVideoEnd: CMTime = .zero
+    /// 테스트 확인용: 패스 재시도 읽기마다 (시작 시각, 성공 여부).
+    internal var retryReads: [(start: CMTime, ok: Bool)] = []
+    /// 테스트 확인용: 리드인 컴포지션을 썼을 때의 리드인 길이.
+    internal var leadIn: CMTime? = nil
+    private var reversingVideoSourceTrack: AVAssetTrack?
     private var reversedAudioAsset: AVAsset?
     private var exportSession: AVAssetExportSession?
     private var audioExporter: ILABAudioTrackExporter?
@@ -129,6 +134,7 @@ open class ILABReverseVideoExportSession: NSObject {
             try? vTrack?.insertTimeRange(timeRange, of: track, at: CMTime.zero)
         }
         self.reversingVideoAsset = videoComposition
+        self.reversingVideoSourceTrack = track
         // Past the source track's end the composition still runs to timeRange's end, yielding empty (black) samples.
         self.reversingVideoEnd = track.map { CMTimeMinimum(videoComposition.duration, CMTimeSubtract($0.timeRange.end, timeRange.start)) }
             ?? videoComposition.duration
@@ -526,12 +532,17 @@ open class ILABReverseVideoExportSession: NSObject {
                 resultsBlock(false, nil, error)
                 return
             }
-            let assetReader = assetReaderOrNil!
+            var assetReader = assetReaderOrNil!
 
             let outputSettings = makeVideoReaderSettings(self.containsHDRVideo, self.containsAlphaChannel, self.isProResType)
             // ObjC passed `firstObject` (nil raised NSInvalidArgumentException); the composition always carries a video track.
-            let assetReaderOutput = AVAssetReaderTrackOutput(
-                track: weakSelf!.reversingVideoAsset!.tracks(withMediaType: AVMediaType.video).first!,
+            var videoTrack = weakSelf!.reversingVideoAsset!.tracks(withMediaType: AVMediaType.video).first!
+            // 리드인을 쓰면 읽기는 리드인 컴포지션에서, 시각은 lead 만큼 뒤로 밀린 채로 다룬다.
+            var readingAsset: AVAsset = weakSelf!.reversingVideoAsset!
+            var lead: CMTime? = nil
+            var videoEnd: CMTime = weakSelf!.reversingVideoEnd
+            var assetReaderOutput = AVAssetReaderTrackOutput(
+                track: videoTrack,
                 outputSettings: outputSettings as? [String: Any])
             assetReaderOutput.supportsRandomAccess = true
             assetReader.add(assetReaderOutput)
@@ -577,9 +588,87 @@ open class ILABReverseVideoExportSession: NSObject {
                 if weakSelf?.showDebug ?? false {
                     NSLog("%@", (assetReader.error?.localizedDescription ?? "(null)") as NSString)
                 }
-                weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorAVAssetReaderReading)
-                resultsBlock(false, nil, weakSelf?.lastError)
-                return
+                // 구간 시작 직전 sync 가 non-IDR 이면 컴포지션 0 부터도 디코딩이 안 된다.
+                // 원본에서 더 앞(거리 2배씩, 마지막은 0)부터 넣은 리드인 컴포지션으로 다시 분석한다.
+                let rangeStart = weakSelf!.timeRange.start
+                var recovered = false
+                if let sourceTrack = weakSelf!.reversingVideoSourceTrack, CMTimeCompare(rangeStart, CMTime.zero) > 0 {
+                    var leadStarts: [CMTime] = []
+                    var back: Int64 = 1
+                    while CMTimeCompare(CMTimeSubtract(rangeStart, CMTimeMake(value: back, timescale: 1)), CMTime.zero) > 0 {
+                        leadStarts.append(CMTimeSubtract(rangeStart, CMTimeMake(value: back, timescale: 1)))
+                        back *= 2
+                    }
+                    leadStarts.append(CMTime.zero)
+                    for leadStart in leadStarts {
+                        let comp = AVMutableComposition()
+                        guard let compTrack = comp.addMutableTrack(withMediaType: AVMediaType.video, preferredTrackID: kCMPersistentTrackID_Invalid),
+                              (try? compTrack.insertTimeRange(CMTimeRangeFromTimeToTime(start: leadStart, end: CMTimeRangeGetEnd(weakSelf!.timeRange)),
+                                                              of: sourceTrack, at: CMTime.zero)) != nil,
+                              let reader = try? AVAssetReader(asset: comp) else { break }
+                        let candidateLead = CMTimeSubtract(rangeStart, leadStart)
+                        let candidateEnd = CMTimeAdd(candidateLead, weakSelf!.reversingVideoEnd)
+                        let candidateTrack = comp.tracks(withMediaType: AVMediaType.video).first!
+                        let output = AVAssetReaderTrackOutput(track: candidateTrack, outputSettings: outputSettings as? [String: Any])
+                        output.supportsRandomAccess = true
+                        reader.add(output)
+                        if !reader.startReading() {
+                            continue
+                        }
+                        if weakSelf?.showDebug ?? false {
+                            NSLog("lead-in from source: %f", CMTimeGetSeconds(leadStart))
+                        }
+                        var times: [CMTime] = []
+                        var straddling = false
+                        while let sample = output.copyNextSampleBuffer() {
+                            if weakSelf?.isCanceledReverseExport() ?? false {
+                                reader.cancelReading()
+                                weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorUserCancel)
+                                resultsBlock(false, nil, weakSelf?.lastError)
+                                return
+                            }
+                            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sample)
+                            if CMTimeCompare(presentationTime, candidateEnd) >= 0 {
+                                continue
+                            }
+                            // 리드인 구간은 버린다. 다만 lead 를 걸친 마지막 프레임은 원래 컴포지션처럼 lead 시각으로 넣는다.
+                            if CMTimeCompare(presentationTime, candidateLead) <= 0 {
+                                straddling = true
+                                continue
+                            }
+                            if times.isEmpty && straddling {
+                                times.append(candidateLead)
+                            }
+                            times.append(presentationTime)
+                            if progressBlock != nil {
+                                weakSelf?.updateProgressBlock(progressBlock,
+                                                              operation: "Analyzing Source Video",
+                                                              progress: Float((CMTimeGetSeconds(CMTimeSubtract(presentationTime, candidateLead)) / CMTimeGetSeconds(weakSelf!.sourceDuration)) * 0.5))
+                            }
+                        }
+                        if times.isEmpty && straddling {
+                            times.append(candidateLead)
+                        }
+                        if reader.status == AVAssetReader.Status.failed {
+                            continue
+                        }
+                        assetReader = reader
+                        assetReaderOutput = output
+                        videoTrack = candidateTrack
+                        readingAsset = comp
+                        lead = candidateLead
+                        videoEnd = candidateEnd
+                        revSampleTimes = times
+                        weakSelf?.leadIn = candidateLead
+                        recovered = true
+                        break
+                    }
+                }
+                if !recovered {
+                    weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorAVAssetReaderReading)
+                    resultsBlock(false, nil, weakSelf?.lastError)
+                    return
+                }
             }
 
             // No samples, no bueno
@@ -644,7 +733,7 @@ open class ILABReverseVideoExportSession: NSObject {
             if (UInt(passDicts.count) < UInt(bitPattern: totalPasses)) ||
                 (cURem(UInt(revSampleTimes.count), UInt(bitPattern: weakSelf!.samplesPerPass)) != 0) {
                 // Ranges are half-open: ending at the last PTS would drop that frame; ending later would read empty samples.
-                let lastPassEndTime = weakSelf!.reversingVideoEnd
+                let lastPassEndTime = videoEnd
                 passDicts.append(ReversePass(
                     passStartTime: passStartTime,
                     passEndTime: lastPassEndTime,
@@ -703,9 +792,11 @@ open class ILABReverseVideoExportSession: NSObject {
                 }
             } while writerEnable == false
 
-            assetWriter?.startSession(atSourceTime: initEventTime)
+            assetWriter?.startSession(atSourceTime: lead.map { CMTimeSubtract(initEventTime, $0) } ?? initEventTime)
 
             var frameCount: Int = 0
+            // 한 번 통한 재시도 시작점은 다음 실패 패스에서도 통할 가능성이 커 먼저 쓴다(재디코딩 비용).
+            var lastGoodRetryStart: CMTime? = nil
 
             var z = passDicts.count - 1
             while z >= 0 {
@@ -745,9 +836,86 @@ open class ILABReverseVideoExportSession: NSObject {
                     if weakSelf?.showDebug ?? false {
                         NSLog("%@", (assetReader.error?.localizedDescription ?? "(null)") as NSString)
                     }
-                    weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorAVAssetReaderReading)
-                    resultsBlock(false, nil, weakSelf?.lastError)
-                    return
+                    // stss 가 non-IDR 프레임을 sync 로 표시한 파일은 그 지점부터 디코딩을 시작해 실패한다.
+                    // 실패한 리더는 재사용할 수 없어 새 리더로 앞 패스 시작점부터 넓혀 다시 읽는다.
+                    // 한 패스씩 물러나면 긴 파일에서 재디코딩이 폭증해 거리를 두 배씩 늘린다.
+                    var retryStarts: [CMTime] = []
+                    if let good = lastGoodRetryStart {
+                        retryStarts.append(good)
+                    }
+                    var step = 1
+                    while z - step >= 0 {
+                        retryStarts.append(passDicts[z - step].passStartTime)
+                        step *= 2
+                    }
+                    retryStarts.append(CMTime.zero)
+                    var tried: [CMTime] = []
+                    var recovered = false
+                    for retryStart in retryStarts where CMTimeCompare(retryStart, passStartTime) < 0 {
+                        if tried.contains(where: { CMTimeCompare($0, retryStart) == 0 }) {
+                            continue
+                        }
+                        tried.append(retryStart)
+                        guard let reader = try? AVAssetReader(asset: readingAsset) else { break }
+                        let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings as? [String: Any])
+                        output.supportsRandomAccess = true
+                        reader.add(output)
+                        reader.timeRange = CMTimeRangeFromTimeToTime(start: retryStart, end: passEndTime)
+                        if !reader.startReading() {
+                            weakSelf?.retryReads.append((retryStart, false))
+                            continue
+                        }
+                        if weakSelf?.showDebug ?? false {
+                            NSLog("retry passStartTime: %f from: %f", CMTimeGetSeconds(passStartTime), CMTimeGetSeconds(retryStart))
+                        }
+                        samples = []
+                        var straddlingSample: CMSampleBuffer? = nil
+                        while let sample = output.copyNextSampleBuffer() {
+                            if weakSelf?.isCanceledReverseExport() ?? false {
+                                reader.cancelReading()
+                                weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorUserCancel)
+                                resultsBlock(false, nil, weakSelf?.lastError)
+                                return
+                            }
+                            // 앞쪽은 디코딩 시작용일 뿐이라 쌓지 않는다(메모리).
+                            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sample)
+                            if CMTimeCompare(presentationTime, passStartTime) < 0 {
+                                // 리드인의 첫 패스는 lead 를 걸친 프레임이 lead 보다 앞 시각으로 나온다.
+                                if let lead = lead, CMTimeCompare(passStartTime, lead) == 0 {
+                                    straddlingSample = sample
+                                }
+                                continue
+                            }
+                            if let straddler = straddlingSample {
+                                if CMTimeCompare(presentationTime, passStartTime) > 0 {
+                                    samples!.append(straddler)
+                                }
+                                straddlingSample = nil
+                            }
+                            samples!.append(sample)
+                        }
+                        if let straddler = straddlingSample, samples!.isEmpty {
+                            samples!.append(straddler)
+                        }
+                        let ok = reader.status != AVAssetReader.Status.failed
+                        weakSelf?.retryReads.append((retryStart, ok))
+                        if ok {
+                            // 남은(더 앞) 패스는 새 리더로 이어 읽는다. 끝까지 읽었으니 reset 가능.
+                            assetReader = reader
+                            assetReaderOutput = output
+                            lastGoodRetryStart = retryStart
+                            recovered = true
+                            break
+                        }
+                        if weakSelf?.showDebug ?? false {
+                            NSLog("%@", (reader.error?.localizedDescription ?? "(null)") as NSString)
+                        }
+                    }
+                    if !recovered {
+                        weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorAVAssetReaderReading)
+                        resultsBlock(false, nil, weakSelf?.lastError)
+                        return
+                    }
                 }
 
                 let samplesCount = samples!.count
@@ -756,7 +924,7 @@ open class ILABReverseVideoExportSession: NSObject {
                         break
                     }
 
-                    let eventTime = revSampleTimes[frameCount]
+                    let eventTime = lead.map { CMTimeSubtract(revSampleTimes[frameCount], $0) } ?? revSampleTimes[frameCount]
 
                     // ObjC passed a possibly-NULL image buffer straight to appendPixelBuffer: (which raises on NULL).
                     let imageBufferRef: CVPixelBuffer = CMSampleBufferGetImageBuffer(samples![(samplesCount - 1) - i])!
