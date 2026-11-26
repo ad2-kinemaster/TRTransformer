@@ -121,6 +121,8 @@ final class DifferentialTranscodeTests: DifferentialTestCase {
 
     func testSizeFrameRateDataRate() throws {
         let src = try makeSource(Fixture.videoOnly)
+        // Since 1.13.3 the Swift session encodes at estimatedDataRate while the oracle (v1.12.19) ignores it —
+        // an intended difference; the record compares structure / frames / pixels, not bit rate.
         differential("T 160x120 10fps 500k") {
             transcodeRecord($0, src, config: TranscodeConfig(size: CGSize(width: 160, height: 120), frameRate: 10, estimatedDataRate: 500_000))
         }

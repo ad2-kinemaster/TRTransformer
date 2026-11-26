@@ -160,6 +160,43 @@ final class TranscodeTests: TRTestCase {
         assertNonDecreasing(f.map(\.index))
     }
 
+    /// The app's quality slider sets `estimatedDataRate`; the encoder must get that value, not the size × fps estimate
+    /// (KIOS-10644: lowest and highest quality produced identical files). 0 keeps the estimate.
+    func testEstimatedDataRate_drivesEncoderBitRate() throws {
+        let src = try makeSource(Fixture.videoOnly)
+        let session = ILABTranscodeSession(asset: AVURLAsset(url: src), timeRange: .init(start: .zero, duration: .init(value: 1, timescale: 1)), outputURL: url("rate.mov"))
+        session.size = CGSize(width: 640, height: 360)
+        session.frameRate = 20
+
+        XCTAssertEqual(session.outputVideoDataRate, (640 * 360 * 20 * 0.17 / 1024) * 1000, accuracy: 1, "unset → size × fps estimate")
+        session.estimatedDataRate = 400_000
+        XCTAssertEqual(session.outputVideoDataRate, 400_000)
+        session.estimatedDataRate = 3_000_000
+        XCTAssertEqual(session.outputVideoDataRate, 3_000_000)
+    }
+
+    /// End to end: the produced file follows `estimatedDataRate` (detailed source, so the encoder spends what it is given).
+    /// With the pre-1.13.3 formula both files came out at 789,584 bps.
+    func testEstimatedDataRate_reachesEncodedFile() throws {
+        let src = try makeSource(Fixture.Spec(videos: [Fixture.Video(width: 640, height: 360, color: Fixture.red, detailed: true)], audios: []))
+        func encode(_ rate: CGFloat, _ name: String) throws -> Double {
+            let (o, out) = transcode(src, out: name, configure: { s in
+                s.size = CGSize(width: 640, height: 360)
+                s.estimatedDataRate = rate
+            })
+            XCTAssertTrue(o.succeeded, describe(o))
+            let bytes = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: out.path)[.size] as? NSNumber).doubleValue
+            let bps = bytes * 8 / Measure.duration(out)
+            log("T rate \(Int(rate)) → \(Int(bps)) bps", out)
+            return bps
+        }
+        let low = try encode(300_000, "low.mov")
+        let high = try encode(3_000_000, "high.mov")
+        XCTAssertEqual(low, 300_000, accuracy: 300_000 * 0.5, "low rate reaches the file")
+        XCTAssertEqual(high, 3_000_000, accuracy: 3_000_000 * 0.5, "high rate reaches the file")
+        XCTAssertGreaterThan(high / low, 4, "quality setting changes the output")
+    }
+
     /// frameRate above the source fps is clamped to the source fps (no frames dropped).
     func testFrameRateAboveSource_isClamped() throws {
         let src = try makeSource(Fixture.videoOnly)

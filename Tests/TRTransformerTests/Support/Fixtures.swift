@@ -31,6 +31,9 @@ enum Fixture {
         var alpha: Bool = false
         var hdrHLG: Bool = false
         var keyFrameInterval: Int = 10
+        /// Moving gradient + light grain instead of flat colour, so the encoder spends the bit rate it is given
+        /// (pure random noise made the simulator encoder ignore the rate). Frame-index (gray) measurements don't apply.
+        var detailed: Bool = false
     }
 
     struct Audio {
@@ -239,6 +242,22 @@ enum Fixture {
         let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
         let stride = CVPixelBufferGetBytesPerRow(buffer)
         let g = gray(forFrame: index)
+        if v.detailed {
+            var r = UInt32(truncatingIfNeeded: index &* 2_654_435_761) | 1
+            for y in 0..<v.height {
+                for x in 0..<v.width {
+                    r ^= r << 13; r ^= r >> 17; r ^= r << 5
+                    // Moving gradient + light grain: real-world-like detail rather than pure entropy.
+                    let n = Int(r & 31) - 16
+                    let p = base + y * stride + x * 4
+                    p[0] = UInt8(clamping: (x + index * 4) % 256 + n)
+                    p[1] = UInt8(clamping: (y * 2 + index * 3) % 256 + n)
+                    p[2] = UInt8(clamping: ((x + y) / 2 + index * 5) % 256 + n)
+                    p[3] = 255
+                }
+            }
+            return buffer
+        }
         for y in 0..<v.height {
             for x in 0..<v.width {
                 let p = base + y * stride + x * 4

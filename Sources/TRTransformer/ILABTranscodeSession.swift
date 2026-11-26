@@ -56,7 +56,14 @@ open class ILABTranscodeSession: NSObject {
             }
         }
     }
-    open var estimatedDataRate: CGFloat = 0                /**< the estimated data rate of the media data, in units of bits per second */
+    open var estimatedDataRate: CGFloat = 0                /**< target video bit rate in bits per second. 0 = estimate from size and frame rate */
+
+    /// Bit rate handed to the video encoder: `estimatedDataRate` when the caller set one,
+    /// otherwise size × frame rate × 0.17 bits per pixel (the only rule before 1.13.3, which ignored `estimatedDataRate`).
+    public var outputVideoDataRate: CGFloat {
+        if estimatedDataRate > 0 { return estimatedDataRate }
+        return ((size.width * size.height * frameRate * 0.17) / 1024) * 1000
+    }
 
     open var deleteCacheFile: Bool = false                 /**< After finishing transcode work, delete temporary files in the Library/Caches, default value is YES */
 
@@ -527,7 +534,7 @@ open class ILABTranscodeSession: NSObject {
             var firstTry = true
 
             repeat {
-                let estimatedDataRate: CGFloat = ((self.size.width * self.size.height * self.frameRate * 0.17) / 1024) * 1000
+                let estimatedDataRate: CGFloat = self.outputVideoDataRate
                 let compressionProperties = makeCompressionProperties(
                     self.sourceSize,
                     estimatedDataRate,
@@ -560,8 +567,14 @@ open class ILABTranscodeSession: NSObject {
 
                 writerEnable = assetWriter?.startWriting() ?? false
                 if writerEnable == false {
-                    firstTry = false
                     try? FileManager.default.removeItem(at: destinationURL)
+                    // Source-matched settings, then the H.264 defaults — nothing else to try. Looping again would spin forever.
+                    guard firstTry else {
+                        weakSelf?.lastError = NSError.ilabSessionError(ILABSessionErrorAVAssetWriterStartWriting)
+                        completeBlock(false, nil, weakSelf?.lastError)
+                        return
+                    }
+                    firstTry = false
                 }
             } while writerEnable == false
 
